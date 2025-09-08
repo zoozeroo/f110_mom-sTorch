@@ -1,0 +1,285 @@
+''' env file
+Author: Hongrui Zheng
+'''
+
+# gym imports
+import gym
+from gym import error, spaces, utils
+from gym.utils import seeding
+
+# base classes
+from f110_gym.envs.base_classes import Simulator
+
+# others
+import numpy as np
+import os
+import time
+
+# gl
+import pyglet
+
+pyglet.options['debug_gl'] = False
+from pyglet import gl
+
+# constants
+
+# rendering
+VIDEO_W = 600
+VIDEO_H = 400
+WINDOW_W = 1000
+WINDOW_H = 800
+
+import math
+class F110Env(gym.Env, utils.EzPickle):
+    metadata = {'render.modes': ['human', 'human_fast']}
+
+    def __init__(self, **kwargs):
+        # kwargs extraction
+        try:
+            self.seed = kwargs['seed']
+        except:
+            self.seed = 12345
+        try:
+            self.map_name = kwargs['map']
+            # different default maps
+            if self.map_name == 'berlin':
+                self.map_path = os.path.dirname(os.path.abspath(__file__)) + '/maps/berlin.yaml'
+            elif self.map_name == 'skirk':
+                self.map_path = os.path.dirname(os.path.abspath(__file__)) + '/maps/skirk.yaml'
+            elif self.map_name == 'levine':
+                self.map_path = os.path.dirname(os.path.abspath(__file__)) + '/maps/levine.yaml'
+            else:
+                self.map_path = self.map_name + '.yaml'
+        except:
+            self.map_path = os.path.dirname(os.path.abspath(__file__)) + '/maps/vegas.yaml'
+
+        try:
+            self.map_ext = kwargs['map_ext']
+        except:
+            self.map_ext = '.png'
+
+        try:
+            self.params = kwargs['params']
+        except:
+            self.params = {'mu': 1.0489, 'C_Sf': 4.718, 'C_Sr': 5.4562, 'lf': 0.15875, 'lr': 0.17145, 'h': 0.074,
+                           'm': 3.74, 'I': 0.04712, 's_min': -0.4189, 's_max': 0.4189, 'sv_min': -3.2, 'sv_max': 3.2,
+                           'v_switch': 7.319, 'a_max': 9.51, 'v_min': -5.0, 'v_max': 20.0, 'width': 0.31,
+                           'length': 0.58}
+
+        # simulation parameters
+        try:
+            self.num_agents = kwargs['num_agents']
+        except:
+            self.num_agents = 2
+
+        try:
+            self.timestep = kwargs['timestep']
+        except:
+            self.timestep = 0.01
+
+        # default ego index
+        try:
+            self.ego_idx = kwargs['ego_idx']
+        except:
+            self.ego_idx = 0
+
+        # radius to consider done
+        self.start_thresh = 0.5  # 10cm
+
+        # env states
+        self.poses_x = []
+        self.poses_y = []
+        self.poses_theta = []
+        self.collisions = np.zeros((self.num_agents,))
+        # TODO: collision_idx not used yet
+        # self.collision_idx = -1 * np.ones((self.num_agents, ))
+
+        # loop completion
+        self.near_start = True
+        self.num_toggles = 0
+
+        # race info
+        self.lap_times = np.zeros((self.num_agents,))
+        self.lap_counts = np.zeros((self.num_agents,))
+        self.current_time = 0.0
+
+        # finish line info
+        self.num_toggles = 0
+        self.near_start = True
+        self.near_starts = np.array([True] * self.num_agents)
+        self.toggle_list = np.zeros((self.num_agents,))
+        self.start_xs = np.zeros((self.num_agents,))
+        self.start_ys = np.zeros((self.num_agents,))
+        self.start_thetas = np.zeros((self.num_agents,))
+        self.start_rot = np.eye(2)
+
+        # initiate stuff
+        self.sim = Simulator(self.params, self.num_agents, self.seed)
+        self.sim.set_map(self.map_path, self.map_ext)
+
+        # rendering
+        self.renderer = None
+        self.current_obs = None
+
+        raceline = np.load('./Oschersleben_raceline_upsampled_new.npy')
+        transformed_raceline = raceline.copy()
+        self.raceline = transformed_raceline
+
+        self.current_goal_idx = 0 # 순차적 목표 달성을 위한 인덱스
+
+
+    def __del__(self):
+        """
+        Finalizer, does cleanup
+        """
+        pass
+
+    def _check_done(self):
+        # this is assuming 2 agents
+        # TODO: switch to maybe s-based
+        left_t = 2
+        right_t = 2
+
+        poses_x = np.array(self.poses_x) - self.start_xs
+        poses_y = np.array(self.poses_y) - self.start_ys
+        delta_pt = np.dot(self.start_rot, np.stack((poses_x, poses_y), axis=0))
+        temp_y = delta_pt[1, :]
+        idx1 = temp_y > left_t
+        idx2 = temp_y < -right_t
+        temp_y[idx1] -= left_t
+        temp_y[idx2] = -right_t - temp_y[idx2]
+        temp_y[np.invert(np.logical_or(idx1, idx2))] = 0
+
+        dist2 = delta_pt[0, :] ** 2 + temp_y ** 2
+        closes = dist2 <= 0.1
+        for i in range(self.num_agents):
+            if closes[i] and not self.near_starts[i]:
+                self.near_starts[i] = True
+                self.toggle_list[i] += 1
+            elif not closes[i] and self.near_starts[i]:
+                self.near_starts[i] = False
+                self.toggle_list[i] += 1
+            self.lap_counts[i] = self.toggle_list[i] // 2
+            if self.toggle_list[i] < 4:
+                self.lap_times[i] = self.current_time
+
+        done = (self.collisions[self.ego_idx]) or np.all(self.toggle_list >= 4)
+
+        return done, self.toggle_list >= 4
+
+    def _update_state(self, obs_dict):
+        self.poses_x = obs_dict['poses_x']
+        self.poses_y = obs_dict['poses_y']
+        self.poses_theta = obs_dict['poses_theta']
+        self.collisions = obs_dict['collisions']
+
+    def step(self, action):
+        obs = self.sim.step(action)
+        obs['lap_times'] = self.lap_times
+        obs['lap_counts'] = self.lap_counts
+
+        self.current_obs = obs
+
+        reward = 1000 * self.timestep
+        
+        # 시야 보상
+        if 490 <= np.argmin(obs['scans'][0]) <= 590:
+            reward -= 1
+        else:
+            reward += 2
+        if min(obs['scans'][0]) < 0.7:
+            reward -= 5
+
+        # 상태 추출
+        x = obs['poses_x'][0]
+        y = obs['poses_y'][0]
+        theta = obs['poses_theta'][0]
+        linear_vel = obs['linear_vels_x'][0]
+        yaw_rate = obs['ang_vels_z'][0]
+
+        # 코너링 안정성 penalty
+        if abs(yaw_rate) > 1.2:
+            reward -= 1.0
+
+        reward += 0.2 * linear_vel 
+
+        # goal 방향과 heading alignment 보상
+        goal = self.raceline[self.current_goal_idx]
+        goal_dir = np.arctan2(goal[1] - y, goal[0] - x)
+        angle_diff = np.abs((goal_dir - theta + np.pi) % (2 * np.pi) - np.pi)  # [-π, π]
+        reward += 2.0 * np.cos(angle_diff)
+
+        # raceline 목표점 도달 체크
+        ref_x = self.raceline[self.current_goal_idx, 0]
+        ref_y = self.raceline[self.current_goal_idx, 1]
+        dist_to_raceline = np.linalg.norm([x - ref_x, y - ref_y])
+        if dist_to_raceline < 1:
+            self.current_goal_idx = min(self.current_goal_idx + 1, len(self.raceline) - 1)
+
+        # 완주 시 리셋
+        if self.current_goal_idx >= len(self.raceline) - 1:
+            self.current_goal_idx = 0
+            reward += 50.0
+
+        # 시간 업데이트
+        self.current_time = self.current_time + self.timestep
+
+        # 상태 업데이트
+        self._update_state(obs)
+
+        # check done
+        done, toggle_list = self._check_done()
+        info = {'checkpoint_done': toggle_list}
+        if self.collisions[self.ego_idx]:
+            reward = 0
+            self.current_goal_idx = 0
+        if self.lap_counts[0] == 2:
+            done = True
+        return obs, reward, done, info
+
+    def reset(self, poses):
+        # reset counters and data members
+        self.current_time = 0.0
+        self.collisions = np.zeros((self.num_agents,))
+        self.num_toggles = 0
+        self.near_start = True
+        self.near_starts = np.array([True] * self.num_agents)
+        self.toggle_list = np.zeros((self.num_agents,))
+
+        # states after reset
+        self.start_xs = poses[:, 0]
+        self.start_ys = poses[:, 1]
+        self.start_thetas = poses[:, 2]
+        self.start_rot = np.array(
+            [[np.cos(-self.start_thetas[self.ego_idx]), -np.sin(-self.start_thetas[self.ego_idx])],
+             [np.sin(-self.start_thetas[self.ego_idx]), np.cos(-self.start_thetas[self.ego_idx])]])
+
+        # call reset to simulator
+        self.sim.reset(poses)
+
+        # get no input observations
+        action = np.zeros((self.num_agents, 2))
+        obs, reward, done, info = self.step(action)
+        return obs, reward, done, info
+
+    def update_map(self, map_path, map_ext):
+        self.sim.set_map(map_path, map_ext)
+
+    def update_params(self, params, index=-1):
+        self.sim.update_params(params, agent_idx=index)
+
+    def render(self, mode='human_fast'):
+        assert mode in ['human', 'human_fast']
+        if self.renderer is None:
+            # first call, initialize everything
+            from f110_gym.envs.rendering import EnvRenderer
+            self.renderer = EnvRenderer(WINDOW_W, WINDOW_H)
+            self.renderer.update_map(self.map_name, self.map_ext)
+        self.renderer.update_obs(self.current_obs)
+        self.renderer.dispatch_events()
+        self.renderer.on_draw()
+        self.renderer.flip()
+        if mode == 'human':
+            time.sleep(0.005)
+        elif mode == 'human_fast':
+            pass
